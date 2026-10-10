@@ -15,7 +15,7 @@ java -cp build SpiderTest
 В первом окне:
 
 ```bat
-java -jar ..\..\course\java\tasks\task_J3\Task_J3-server.jar MikhailDeshin
+java -jar lib\Task_J3-server.jar MikhailDeshin
 ```
 
 В втором окне:
