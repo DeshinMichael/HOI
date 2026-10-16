@@ -2,6 +2,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -58,10 +59,22 @@ public class SortListTest {
                 mode + ": sorted order or duplicate preservation");
     }
 
-    private static void testPromptSnapshot() throws Exception {
+    private static void testFullSweep() throws Exception {
+        List<String> lines = new ArrayList<>();
+        StringBuilder expected = new StringBuilder("--- 100 records ---\n");
+        for (int i = 0; i < 100; i++) {
+            String value = String.format("%03d", i);
+            lines.add(value);
+            expected.append(value).append('\n');
+        }
+        String output = run(new String[] { "SortList", "linked", "4", "0" }, lines, 1000);
+        check(output.contains(expected), "linked: workers did not sweep the whole list");
+    }
+
+    private static void testPromptSnapshot(String mode) throws Exception {
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         Process process = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"),
-                "SortList", "standard", "1", "1500").redirectErrorStream(true).start();
+                "SortList", mode, "1", "1500").redirectErrorStream(true).start();
         try (var input = process.outputWriter(StandardCharsets.UTF_8);
              var output = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
             output.readLine();
@@ -74,8 +87,8 @@ public class SortListTest {
             while (!output.ready() && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) < 900) {
                 Thread.sleep(10);
             }
-            check(output.ready(), "standard: printing waits for the sorting delay");
-            check("--- 2 records ---".equals(output.readLine()), "standard: snapshot header");
+            check(output.ready(), mode + ": printing waits for the sorting delay");
+            check("--- 2 records ---".equals(output.readLine()), mode + ": snapshot header");
         } finally {
             process.destroyForcibly();
             process.waitFor();
@@ -88,8 +101,12 @@ public class SortListTest {
             testSorting(mode);
             System.out.println("PASS " + mode + ": input, splitting, sorting, duplicates");
         }
-        testPromptSnapshot();
-        System.out.println("PASS standard: prompt snapshot during sorting delay");
+        testFullSweep();
+        System.out.println("PASS linked: full-list sweep");
+        for (String mode : List.of("linked", "standard")) {
+            testPromptSnapshot(mode);
+            System.out.println("PASS " + mode + ": prompt snapshot during sorting delay");
+        }
         String stress = run(new String[] { "SortList", "--verify" }, null, 0);
         check(stress.contains("PASS linked:") && stress.contains("PASS standard:"),
                 "Concurrent snapshot check");

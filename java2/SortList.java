@@ -7,6 +7,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class SortList {
@@ -21,12 +22,23 @@ public class SortList {
             final String value;
             final ReentrantLock lock = new ReentrantLock();
             Node next;
+            long linkVersion;
             Node(String value) { this.value = value; }
+        }
+
+        private static class Cursor {
+            int index = -1;
+            int size;
+            Node anchor;
+            Node previous;
+            long anchorVersion;
+            long previousVersion;
         }
 
         private final Node head = new Node(null);
         private final AtomicInteger size = new AtomicInteger();
         private final AtomicLong version = new AtomicLong();
+        private final ThreadLocal<Cursor> cursors = ThreadLocal.withInitial(Cursor::new);
 
         public void addFirst(String value) {
             head.lock.lock();
@@ -34,6 +46,7 @@ public class SortList {
                 Node node = new Node(value);
                 node.next = head.next;
                 head.next = node;
+                head.linkVersion++;
                 size.incrementAndGet();
                 version.incrementAndGet();
             } finally {
@@ -80,25 +93,61 @@ public class SortList {
             nodes[0].lock.unlock();
         }
 
+        private Node[] pairAt(int index, Cursor cursor) {
+            if (index > 0 && cursor.index == index && cursor.size == size.get()) {
+                Node anchor = cursor.anchor;
+                Node previous = cursor.previous;
+                anchor.lock.lock();
+                if (anchor.linkVersion == cursor.anchorVersion && anchor.next == previous) {
+                    previous.lock.lock();
+                    if (previous.linkVersion == cursor.previousVersion && cursor.size == size.get()) {
+                        anchor.lock.unlock();
+                        Node current = previous.next;
+                        if (current != null) {
+                            current.lock.lock();
+                            Node following = current.next;
+                            if (following != null) {
+                                following.lock.lock();
+                                return new Node[] { previous, current, following };
+                            }
+                            current.lock.unlock();
+                        }
+                        previous.lock.unlock();
+                        return pairAt(index);
+                    }
+                    previous.lock.unlock();
+                }
+                anchor.lock.unlock();
+            }
+            return pairAt(index);
+        }
+
         public boolean step(int index, long insideDelayMs) throws InterruptedException {
-            Node[] before = pairAt(index);
-            if (before == null) return false;
-            int comparison;
-            try { comparison = before[1].value.compareTo(before[2].value); }
-            finally { unlock(before); }
+            if (index < 0 || index + 1 >= size.get()) return false;
             Thread.sleep(insideDelayMs);
-            Node[] nodes = pairAt(index);
+            int sizeAtLookup = size.get();
+            Cursor cursor = cursors.get();
+            Node[] nodes = pairAt(index, cursor);
             if (nodes == null) return false;
             try {
                 Node previous = nodes[0], current = nodes[1], following = nodes[2];
-                int order = current == before[1] && following == before[2]
-                        ? comparison : current.value.compareTo(following.value);
-                if (order > 0) {
+                boolean swapped = current.value.compareTo(following.value) > 0;
+                if (swapped) {
                     current.next = following.next;
+                    current.linkVersion++;
                     following.next = current;
+                    following.linkVersion++;
                     previous.next = following;
+                    previous.linkVersion++;
                     version.incrementAndGet();
                 }
+                Node nextPrevious = swapped ? following : current;
+                cursor.index = index + 1;
+                cursor.size = sizeAtLookup;
+                cursor.anchor = previous;
+                cursor.previous = nextPrevious;
+                cursor.anchorVersion = previous.linkVersion;
+                cursor.previousVersion = nextPrevious.linkVersion;
                 return true;
             } finally {
                 unlock(nodes);
@@ -162,6 +211,7 @@ public class SortList {
     private static class Workers implements AutoCloseable {
         private final Thread[] threads;
         private final AtomicLong steps = new AtomicLong();
+        private final AtomicReference<Throwable> failure = new AtomicReference<>();
         private volatile boolean running = true;
 
         Workers(StringList list, int count, long delayMs) {
@@ -180,13 +230,19 @@ public class SortList {
                         }
                     } catch (InterruptedException ex) {
                         Thread.currentThread().interrupt();
+                    } catch (RuntimeException | Error ex) {
+                        failure.compareAndSet(null, ex);
                     }
                 }, "bubble-" + (i + 1));
                 threads[i].start();
             }
         }
 
-        long steps() { return steps.get(); }
+        long steps() {
+            Throwable error = failure.get();
+            if (error != null) throw new IllegalStateException("Sorting worker failed", error);
+            return steps.get();
+        }
 
         public void close() {
             running = false;
@@ -195,6 +251,8 @@ public class SortList {
                 try { thread.join(); }
                 catch (InterruptedException ex) { Thread.currentThread().interrupt(); break; }
             }
+            Throwable error = failure.get();
+            if (error != null) throw new IllegalStateException("Sorting worker failed", error);
         }
     }
 
@@ -250,6 +308,21 @@ public class SortList {
             }
         }
         System.out.println("PASS " + mode + ": 500 snapshots during sorting preserve all 200 records");
+
+        StringList growing = list(mode);
+        List<String> inserted = new ArrayList<>();
+        try (Workers ignored = new Workers(growing, 4, 0)) {
+            for (int i = 0; i < 100; i++) {
+                String value = String.format("new-%03d", i);
+                growing.addFirst(value);
+                inserted.add(value);
+                List<String> observed = new ArrayList<>();
+                for (String record : growing) observed.add(record);
+                Collections.sort(observed);
+                if (!inserted.equals(observed)) throw new AssertionError("Lost, duplicate or changed inserted record");
+            }
+        }
+        System.out.println("PASS " + mode + ": concurrent insertion and snapshots preserve all 100 records");
     }
 
     public static void main(String[] args) throws Exception {
